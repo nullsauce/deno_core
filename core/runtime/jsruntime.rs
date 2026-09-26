@@ -102,6 +102,11 @@ pub type ExtensionTranspiler =
 pub(crate) struct IsolateAllocations {
   pub(crate) externalized_sources: Box<[v8::OneByteConst]>,
   pub(crate) original_sources: Box<[FastString]>,
+  /// External source strings inherited from the startup snapshot, in
+  /// external-reference table order (they come first, before this runtime's
+  /// own sources). The heap references them by index, so `snapshot()` must
+  /// write them back into the new sidecar ahead of `original_sources`.
+  pub(crate) inherited_external_strings: Vec<&'static [u8]>,
   pub(crate) near_heap_limit_callback_data:
     Option<(Box<RefCell<dyn Any>>, v8::NearHeapLimitCallback)>,
 }
@@ -809,6 +814,7 @@ impl JsRuntime {
       .as_mut()
       .map(|s| std::mem::take(&mut s.snapshot_data.external_strings))
       .unwrap_or_default();
+    isolate_allocations.inherited_external_strings = snapshot_sources.clone();
     (
       isolate_allocations.externalized_sources,
       isolate_allocations.original_sources,
@@ -2317,9 +2323,14 @@ impl JsRuntimeForSnapshot {
     self.inner.prepare_for_cleanup();
     let original_sources =
       std::mem::take(&mut self.0.allocations.original_sources);
-    let external_strings = original_sources
-      .iter()
-      .map(|s| s.as_str().as_bytes())
+    // Strings inherited from the startup snapshot keep their table positions
+    // ahead of this runtime's own sources (see `IsolateAllocations`).
+    let inherited_external_strings =
+      std::mem::take(&mut self.0.allocations.inherited_external_strings);
+    let inherited_count = inherited_external_strings.len();
+    let external_strings = inherited_external_strings
+      .into_iter()
+      .chain(original_sources.iter().map(|s| s.as_str().as_bytes()))
       .collect();
     let realm = JsRealm::clone(&self.inner.main_realm);
 
@@ -2385,7 +2396,7 @@ impl JsRuntimeForSnapshot {
         function_templates_data,
         op_count: self.inner.op_count,
         addl_refs_count: self.inner.addl_refs_count,
-        source_count: self.inner.source_count,
+        source_count: inherited_count + self.inner.source_count,
         extensions: self.inner.extensions.clone(),
         js_handled_promise_rejection_cb: maybe_js_handled_promise_rejection_cb,
         ext_import_meta_proto,
